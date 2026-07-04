@@ -24,7 +24,7 @@ def save_db(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- 1. 核心翻译引擎 (查词) ---
+# --- 1. 核心翻译引擎 (升级：强制同义词/反义词的中法双语结构) ---
 @st.cache_data(show_spinner=False, ttl=86400) 
 def get_translation(word):
     prompt = f"""
@@ -38,8 +38,8 @@ def get_translation(word):
         "part_of_speech": "原型词词性",
         "english": "英文翻译",
         "chinese": "中文翻译",
-        "synonyms": ["同义词1", "同义词2"],
-        "antonyms": ["反义词1 (如无明显反义词则填无)"],
+        "synonyms": [{{"fr": "法语同义词", "cn": "中文翻译"}}],
+        "antonyms": [{{"fr": "法语反义词", "cn": "中文翻译"}}],
         "collocations": ["搭配1 (中文)", "搭配2 (中文)"], 
         "example_fr": "包含该单词的实用例句",
         "example_cn": "例句的中文翻译",
@@ -87,7 +87,7 @@ def get_dialogue(word):
     except Exception as e:
         return {"error": str(e)}
 
-# --- 1.8 句子互译引擎 (全新翻译模块) ---
+# --- 1.8 句子互译引擎 ---
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_text_translation(text):
     prompt = f"""
@@ -154,7 +154,6 @@ if 'current_word' not in st.session_state:
 
 st.title("🇫🇷 TCF 核心词库系统")
 
-# ✨ 新增第五个 Tab：句子翻译
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 查词", "⭐ 背诵", "🕒 历史", "🎯 盲盒", "🌐 翻译"])
 
 # ================= TAB 1: 查词工作台 =================
@@ -196,19 +195,35 @@ with tab1:
         if cw.get("conjugation"):
             st.warning(f"⚙️ 变位: {cw.get('conjugation')}")
         
+        # ✨ 升级：同义词与反义词结构化解析 ✨
         if cw.get("synonyms") or cw.get("antonyms"):
-            st.markdown("### 🧬 词汇拓展")
+            st.markdown("### 🧬 词汇拓展 (点击直接跳转)")
             col_syn, col_ant = st.columns(2)
             with col_syn:
                 st.write("**同义词:**")
-                for syn in cw.get("synonyms", []):
-                    if st.button(f"🔍 {syn}", key=f"syn_{syn}_{cw['original_word']}"):
-                        execute_search(syn)
+                for i, syn in enumerate(cw.get("synonyms", [])):
+                    if isinstance(syn, dict) and syn.get("fr"):
+                        btn_label = f"🔍 {syn.get('fr')} ({syn.get('cn', '')})"
+                        target_word = syn.get('fr')
+                    else:
+                        btn_label = f"🔍 {syn}"
+                        target_word = str(syn)
+                        
+                    if st.button(btn_label, key=f"syn_{i}_{cw['original_word']}"):
+                        execute_search(target_word)
+                        
             with col_ant:
                 st.write("**反义词:**")
-                for ant in cw.get("antonyms", []):
-                    if st.button(f"🔍 {ant}", key=f"ant_{ant}_{cw['original_word']}"):
-                        execute_search(ant)
+                for i, ant in enumerate(cw.get("antonyms", [])):
+                    if isinstance(ant, dict) and ant.get("fr"):
+                        btn_label = f"🔍 {ant.get('fr')} ({ant.get('cn', '')})"
+                        target_word = ant.get('fr')
+                    else:
+                        btn_label = f"🔍 {ant}"
+                        target_word = str(ant)
+                        
+                    if st.button(btn_label, key=f"ant_{i}_{cw['original_word']}"):
+                        execute_search(target_word)
             
         collocations = cw.get("collocations", [])
         if collocations:
@@ -236,7 +251,6 @@ with tab1:
                     for line in d_data.get('dialogue', []):
                         st.write(f"**{line.get('speaker')}**: {line.get('fr')}")
                         st.caption(f"_{line.get('cn')}_")
-                        # ✨ 改造：给对话的每一句加上独立的发音按钮 ✨
                         dia_audio = get_audio_sync(line.get('fr'), "dialogue")
                         st.audio(dia_audio, format="audio/mp3")
                 else:
@@ -300,7 +314,7 @@ with tab4:
             fc_audio = get_audio_sync(fc_w.get("word_with_article"), "fc")
             st.audio(fc_audio, format="audio/mp3")
 
-# ================= TAB 5: 句子翻译 (全新模块) =================
+# ================= TAB 5: 句子翻译 (升级：加入语音) =================
 with tab5:
     st.header("🌐 智能中法互译")
     st.caption("输入法语长句自动翻译为中文；输入中文自动翻译为地道法语。")
@@ -310,7 +324,11 @@ with tab5:
         trans_btn = st.form_submit_button("开始翻译 🚀")
         
     if trans_btn and trans_input:
-        with st.spinner("正在呼叫翻译官..."):
+        with st.spinner("正在呼叫翻译官并录制发音..."):
             result = get_text_translation(trans_input)
             st.success("翻译结果：")
             st.write(f"**{result}**")
+            
+            # ✨ 升级：为翻译结果挂载音频节点 ✨
+            trans_audio = get_audio_sync(result, "trans")
+            st.audio(trans_audio, format="audio/mp3")
