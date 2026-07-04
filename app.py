@@ -1,0 +1,277 @@
+import streamlit as st
+import requests
+import json
+import asyncio
+import edge_tts
+import os
+import random
+import hashlib
+from datetime import datetime
+
+# --- 核心配置区 ---
+API_URL = "https://api.deepseek.com/chat/completions" 
+# 把原来的 "sk-xxxx" 删掉，改成下面这行代码：
+API_KEY = st.secrets["DEEPSEEK_API_KEY"] 
+DB_FILE = "my_vocab_db.json"
+
+# --- 0. 数据库引擎 ---
+def load_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"history": [], "favorites": []}
+
+def save_db(data):
+    with open(DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+# --- 1. 核心翻译引擎 ---
+@st.cache_data(show_spinner=False, ttl=86400) 
+def get_translation(word):
+    prompt = f"""
+    我正在备考法语 TCF 考试，请精准分析用户输入的法语单词："{word}"。
+    【指令】：如果是变位/变形词，请还原为原型（Base Form）解析！
+    
+    按以下 JSON 输出：
+    {{
+        "word_origin": "如是变位变形词，解释来源；若是原型则留空",
+        "word_with_article": "名词加 un/une 或 le/la，动词等原样",
+        "part_of_speech": "原型词词性",
+        "english": "英文翻译",
+        "chinese": "中文翻译",
+        "synonyms": ["同义词1", "同义词2"],
+        "antonyms": ["反义词1 (如无明显反义词则填无)"],
+        "collocations": ["搭配1 (中文)", "搭配2 (中文)"], 
+        "example_fr": "包含该单词的实用例句",
+        "example_cn": "例句的中文翻译",
+        "conjugation": "动词提供直陈式现在时变位；非动词留空"
+    }}
+    """
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+    
+    try:
+        response = requests.post(API_URL, headers=headers, json=data)
+        resp_data = response.json()
+        if 'choices' not in resp_data:
+            return {"error": f"API 拒绝请求：{resp_data}"}
+        result_text = resp_data['choices'][0]['message']['content']
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0].strip()
+        return json.loads(result_text)
+    except Exception as e:
+        return {"error": str(e)}
+
+# --- 1.5 实战对话生成引擎 ---
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_dialogue(word):
+    prompt = f"""
+    请使用法语单词 "{word}" 编写一段非常简短的日常生活双人对话（A和B）。
+    严格按以下 JSON 格式输出：
+    {{
+        "scenario": "一句话描述场景（如：在巴黎的咖啡馆）",
+        "dialogue": [
+            {{"speaker": "A", "fr": "法语句子", "cn": "中文翻译"}},
+            {{"speaker": "B", "fr": "法语句子", "cn": "中文翻译"}}
+        ]
+    }}
+    """
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.5}
+    
+    try:
+        response = requests.post(API_URL, headers=headers, json=data)
+        result_text = response.json()['choices'][0]['message']['content']
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0].strip()
+        return json.loads(result_text)
+    except Exception as e:
+        return {"error": str(e)}
+
+# --- 2. 同步发音引擎 (完美修复音频不刷新 Bug) ---
+@st.cache_data(show_spinner=False)
+def get_audio_sync(text, prefix="audio"):
+    # 给每段文本生成一个独一无二的 MD5 签名，彻底解决浏览器缓存贴图不刷新的问题
+    text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+    filename = f"{prefix}_{text_hash}.mp3"
+    return asyncio.run(generate_audio(text, filename))
+
+async def generate_audio(text, filename):
+    # 增加本地查重机制：如果这个专属文件已经存在，直接复用，不仅解决 bug 还极大地提升速度
+    if not os.path.exists(filename):
+        communicate = edge_tts.Communicate(text, "fr-FR-DeniseNeural")
+        await communicate.save(filename)
+    return filename
+
+# --- 3. 界面绘制 ---
+st.set_page_config(page_title="TCF 专属法语词典", page_icon="🇫🇷", layout="centered")
+
+if 'db' not in st.session_state:
+    st.session_state.db = load_db()
+if 'current_word' not in st.session_state:
+    st.session_state.current_word = None
+
+st.title("🇫🇷 TCF 核心词库系统")
+
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 查词工作台", "⭐ 我的背诵列表", "🕒 历史记录", "🎯 刷词大挑战"])
+
+# ================= TAB 1: 查词工作台 =================
+with tab1:
+    # 极简智能合并搜索框
+    with st.form("search_form", clear_on_submit=True):
+        word_input = st.text_input("🔍 请输入法语单词 (自动匹配历史词库或全网解析)：").strip()
+        submit_btn = st.form_submit_button("🚀 极速解析")
+        
+    if submit_btn and word_input:
+        found_local = None
+        for item in st.session_state.db['history']:
+            if item['original_word'].lower() == word_input.lower():
+                found_local = item
+                break
+                
+        if found_local:
+            st.session_state.current_word = found_local
+            st.toast(f"⚡ 已从本地词库极速加载！", icon="⚡")
+        else:
+            with st.spinner("引擎全速解析并生成语音中..."):
+                data = get_translation(word_input)
+                if "error" in data:
+                    st.error(data['error'])
+                else:
+                    data['query_time'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    data['original_word'] = word_input
+                    st.session_state.current_word = data
+                    st.session_state.db['history'].insert(0, data)
+                    save_db(st.session_state.db)
+        st.rerun() 
+
+    if st.session_state.current_word:
+        cw = st.session_state.current_word
+        st.markdown("---")
+        
+        if cw.get("word_origin"):
+            st.info(f"💡 **词形溯源**：{cw.get('word_origin')}")
+            
+        is_favorited = any(item.get('original_word') == cw['original_word'] for item in st.session_state.db['favorites'])
+        
+        col_title, col_btn = st.columns([3, 1])
+        with col_title:
+            st.subheader(f"✨ {cw.get('word_with_article', cw['original_word'])}")
+        with col_btn:
+            if is_favorited:
+                st.button("✅ 已收藏", disabled=True)
+            else:
+                if st.button("❤️ 加入背诵"):
+                    st.session_state.db['favorites'].insert(0, cw)
+                    save_db(st.session_state.db)
+                    st.rerun() 
+                    
+        st.caption(f"词性：{cw.get('part_of_speech', '')}")
+        st.success(f"🇨🇳 {cw.get('chinese', '')}  |  🇬🇧 {cw.get('english', '')}")
+        
+        # 这里的音频生成已经切换为防缓存修复版
+        word_audio = get_audio_sync(cw.get("word_with_article", cw['original_word']), "word")
+        st.audio(word_audio, format="audio/mp3")
+        
+        if cw.get("conjugation"):
+            st.warning(f"⚙️ 变位: {cw.get('conjugation')}")
+        
+        if cw.get("synonyms") or cw.get("antonyms"):
+            st.markdown("### 🧬 词汇拓展")
+            col_syn, col_ant = st.columns(2)
+            with col_syn:
+                st.write("**同义词:**")
+                for syn in cw.get("synonyms", []):
+                    st.write(f"🟢 {syn}")
+            with col_ant:
+                st.write("**反义词:**")
+                for ant in cw.get("antonyms", []):
+                    st.write(f"🔴 {ant}")
+            
+        collocations = cw.get("collocations", [])
+        if collocations:
+            st.markdown("### 🔗 常用搭配")
+            for col in collocations:
+                st.write(f"- {col}")
+            
+        st.markdown("### 📝 实用例句")
+        st.write(f"**{cw.get('example_fr', '')}**")
+        st.write(f"*{cw.get('example_cn', '')}*")
+        
+        if cw.get("example_fr"):
+            example_audio = get_audio_sync(cw.get("example_fr"), "example")
+            st.audio(example_audio, format="audio/mp3")
+            
+        st.markdown("---")
+        if st.button("💬 一键生成【生活实战场景对话】"):
+            st.session_state.dialogue_for = cw['original_word']
+            
+        if st.session_state.get('dialogue_for') == cw['original_word']:
+            with st.spinner("正在连线大模型排练对话剧本..."):
+                d_data = get_dialogue(cw['original_word'])
+                if "error" not in d_data:
+                    st.info(f"🎭 **场景：{d_data.get('scenario', '')}**")
+                    for line in d_data.get('dialogue', []):
+                        st.write(f"**{line.get('speaker')}**: {line.get('fr')}")
+                        st.caption(f"_{line.get('cn')}_")
+                else:
+                    st.error("生成对话失败，请重试。")
+
+# ================= TAB 2: 我的背诵列表 =================
+with tab2:
+    st.header("⭐ 待攻克核心词汇")
+    if not st.session_state.db['favorites']:
+        st.info("你的背诵列表还是空的，快去查词台添加吧！")
+    
+    for item in st.session_state.db['favorites']:
+        with st.expander(f"{item.get('word_with_article')} - {item.get('chinese')}"):
+            if item.get("word_origin"):
+                st.caption(f"💡 {item.get('word_origin')}")
+            st.write(f"**词性**: {item.get('part_of_speech')}")
+            st.write(f"**例句**: {item.get('example_fr')}")
+
+# ================= TAB 3: 历史记录 =================
+with tab3:
+    st.header("🕒 查词轨迹")
+    for i, item in enumerate(st.session_state.db['history'][:50]):
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.write(f"**{item.get('word_with_article')}** ({item.get('chinese')})")
+            st.caption(f"时间: {item.get('query_time')}")
+        with col2:
+            if st.button("🔄 查看", key=f"hist_btn_{i}_{item.get('original_word')}"):
+                st.session_state.current_word = item
+                st.toast(f"✅ 已加载【{item.get('word_with_article')}】，请返回【查词工作台】！", icon="🚀")
+        st.divider()
+
+# ================= TAB 4: 刷词大挑战 =================
+with tab4:
+    st.header("🎯 盲盒记忆挑战")
+    if not st.session_state.db['favorites']:
+        st.warning("背诵列表为空！请先去查词台【加入背诵】。")
+    else:
+        if 'fc_word' not in st.session_state:
+            st.session_state.fc_word = random.choice(st.session_state.db['favorites'])
+            st.session_state.fc_revealed = False
+            
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            if st.button("🎲 换一个词"):
+                st.session_state.fc_word = random.choice(st.session_state.db['favorites'])
+                st.session_state.fc_revealed = False
+                st.rerun()
+                
+        st.markdown(f"<h2 style='text-align: center; color: #1E90FF; padding: 2rem 0;'>{st.session_state.fc_word.get('word_with_article')}</h2>", unsafe_allow_html=True)
+        
+        if not st.session_state.fc_revealed:
+            if st.button("👀 翻开底牌，查看释义", use_container_width=True):
+                st.session_state.fc_revealed = True
+                st.rerun()
+        else:
+            fc_w = st.session_state.fc_word
+            st.success(f"🇨🇳 **{fc_w.get('chinese')}**")
+            st.write(f"**英文**: {fc_w.get('english')}")
+            st.info(f"**例句**: {fc_w.get('example_fr')}\n\n_{fc_w.get('example_cn')}_")
+            
+            fc_audio = get_audio_sync(fc_w.get("word_with_article"), "fc")
+            st.audio(fc_audio, format="audio/mp3")
