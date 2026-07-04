@@ -6,13 +6,12 @@ import edge_tts
 import os
 import random
 import hashlib
-import csv
-import io
+import genanki # ✨ 新增：Anki 原生打包库
 from datetime import datetime
 
 # --- 核心配置区 ---
 API_URL = "https://api.deepseek.com/chat/completions" 
-API_KEY = st.secrets["DEEPSEEK_API_KEY"] 
+API_KEY = "你的_API_KEY_填在这里" 
 DB_FILE = "my_vocab_db.json"
 
 # --- 0. 数据库引擎 ---
@@ -26,23 +25,42 @@ def save_db(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- 0.5 导出引擎 (新增：将 JSON 转换为 Anki 兼容的 CSV 格式) ---
-def generate_anki_csv(favorites):
-    output = io.StringIO()
-    writer = csv.writer(output)
-    # 写入表头
-    writer.writerow(['法语单词', '中文释义', '词性', '例句', '例句翻译', '词形溯源'])
+# --- 0.5 导出引擎 (核心：生成 .apkg 文件) ---
+def generate_apkg(favorites):
+    # 定义 Anki 卡片模型 (ID 随机生成)
+    model_id = random.randrange(1 << 30, 1 << 31)
+    deck_id = random.randrange(1 << 30, 1 << 31)
+    
+    my_model = genanki.Model(
+      model_id,
+      'TCF French Model',
+      fields=[{'name': 'Question'}, {'name': 'Answer'}],
+      templates=[{
+        'name': 'Card 1',
+        'qfmt': '{{Question}}',
+        'afmt': '{{FrontSide}}<hr id="answer">{{Answer}}',
+      }])
+
+    my_deck = genanki.Deck(deck_id, 'TCF 核心词库')
+
     for item in favorites:
-        writer.writerow([
-            item.get('word_with_article', ''),
-            item.get('chinese', ''),
-            item.get('part_of_speech', ''),
-            item.get('example_fr', ''),
-            item.get('example_cn', ''),
-            item.get('word_origin', '')
-        ])
-    # 必须使用 utf-8-sig 编码，否则导出后用 Excel 打开法语字符和中文会乱码
-    return output.getvalue().encode('utf-8-sig')
+        question = f"<h3>{item.get('word_with_article')}</h3>"
+        answer = f"<div><b>中文</b>: {item.get('chinese')}</div><br>" \
+                 f"<div><b>词性</b>: {item.get('part_of_speech')}</div><br>" \
+                 f"<div><b>例句</b>: {item.get('example_fr')}</div><br>" \
+                 f"<div><i>{item.get('example_cn')}</i></div>"
+        
+        note = genanki.Note(model=my_model, fields=[question, answer])
+        my_deck.add_note(note)
+
+    # 打包并存入内存
+    pkg_name = f"tcf_vocab_{datetime.now().strftime('%Y%m%d')}.apkg"
+    genanki.Package(my_deck).write_to_file(pkg_name)
+    
+    with open(pkg_name, 'rb') as f:
+        data = f.read()
+    os.remove(pkg_name) # 清理临时文件
+    return data, pkg_name
 
 # --- 1. 核心翻译引擎 ---
 @st.cache_data(show_spinner=False, ttl=86400) 
@@ -81,7 +99,7 @@ def get_translation(word):
     except Exception as e:
         return {"error": str(e)}
 
-# --- 1.5 实战对话生成引擎 ---
+# --- 1.5 实战对话生成引擎 & 1.8 句子互译引擎 ---
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_dialogue(word):
     prompt = f"""
@@ -107,7 +125,6 @@ def get_dialogue(word):
     except Exception as e:
         return {"error": str(e)}
 
-# --- 1.8 句子互译引擎 ---
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_text_translation(text):
     prompt = f"""
@@ -216,31 +233,28 @@ with tab1:
             st.warning(f"⚙️ 变位: {cw.get('conjugation')}")
         
         if cw.get("synonyms") or cw.get("antonyms"):
-            st.markdown("### 🧬 词汇拓展 (点击直接跳转)")
+            st.markdown("### 🧬 词汇拓展")
             col_syn, col_ant = st.columns(2)
             with col_syn:
                 st.write("**同义词:**")
                 for i, syn in enumerate(cw.get("synonyms", [])):
                     if isinstance(syn, dict) and syn.get("fr"):
-                        btn_label = f"🔍 {syn.get('fr')} ({syn.get('cn', '')})"
+                        btn_label = f"🔍 {syn.get('fr')}"
                         target_word = syn.get('fr')
                     else:
                         btn_label = f"🔍 {syn}"
                         target_word = str(syn)
-                        
                     if st.button(btn_label, key=f"syn_{i}_{cw['original_word']}"):
                         execute_search(target_word)
-                        
             with col_ant:
                 st.write("**反义词:**")
                 for i, ant in enumerate(cw.get("antonyms", [])):
                     if isinstance(ant, dict) and ant.get("fr"):
-                        btn_label = f"🔍 {ant.get('fr')} ({ant.get('cn', '')})"
+                        btn_label = f"🔍 {ant.get('fr')}"
                         target_word = ant.get('fr')
                     else:
                         btn_label = f"🔍 {ant}"
                         target_word = str(ant)
-                        
                     if st.button(btn_label, key=f"ant_{i}_{cw['original_word']}"):
                         execute_search(target_word)
             
@@ -275,20 +289,20 @@ with tab1:
                 else:
                     st.error("生成对话失败，请重试。")
 
-# ================= TAB 2: 我的背诵列表 (升级：新增 Anki 导出) =================
+# ================= TAB 2: 我的背诵列表 (Anki 导出) =================
 with tab2:
     st.header("⭐ 待攻克核心词汇")
     if not st.session_state.db['favorites']:
         st.info("你的背诵列表还是空的，快去查词台添加吧！")
     else:
-        # ✨ 新增：生成 CSV 并提供下载按钮 ✨
-        csv_data = generate_anki_csv(st.session_state.db['favorites'])
+        # ✨ 升级：导出为 .apkg 格式 ✨
+        apkg_data, filename = generate_apkg(st.session_state.db['favorites'])
         st.download_button(
-            label="💾 一键导出为 Anki 格式 (CSV)",
-            data=csv_data,
-            file_name=f"tcf_vocab_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            help="下载后可直接导入 Anki，第一列为正面，后面几列为背面。"
+            label="💾 一键导出为 Anki 牌组 (.apkg)",
+            data=apkg_data,
+            file_name=filename,
+            mime="application/octet-stream",
+            help="下载后发送到手机，点击即可导入 Anki App！"
         )
         st.divider()
     
@@ -298,65 +312,3 @@ with tab2:
                 st.caption(f"💡 {item.get('word_origin')}")
             st.write(f"**词性**: {item.get('part_of_speech')}")
             st.write(f"**例句**: {item.get('example_fr')}")
-
-# ================= TAB 3: 历史记录 =================
-with tab3:
-    st.header("🕒 查词轨迹")
-    for i, item in enumerate(st.session_state.db['history'][:50]):
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            st.write(f"**{item.get('word_with_article')}** ({item.get('chinese')})")
-            st.caption(f"时间: {item.get('query_time')}")
-        with col2:
-            if st.button("🔄 查看", key=f"hist_btn_{i}_{item.get('original_word')}"):
-                execute_search(item['original_word'])
-        st.divider()
-
-# ================= TAB 4: 刷词大挑战 =================
-with tab4:
-    st.header("🎯 盲盒记忆挑战")
-    if not st.session_state.db['favorites']:
-        st.warning("背诵列表为空！请先去查词台【加入背诵】。")
-    else:
-        if 'fc_word' not in st.session_state:
-            st.session_state.fc_word = random.choice(st.session_state.db['favorites'])
-            st.session_state.fc_revealed = False
-            
-        col1, col2 = st.columns([3, 1])
-        with col2:
-            if st.button("🎲 换一个词"):
-                st.session_state.fc_word = random.choice(st.session_state.db['favorites'])
-                st.session_state.fc_revealed = False
-                st.rerun()
-                
-        st.markdown(f"<h2 style='text-align: center; color: #1E90FF; padding: 2rem 0;'>{st.session_state.fc_word.get('word_with_article')}</h2>", unsafe_allow_html=True)
-        
-        if not st.session_state.fc_revealed:
-            if st.button("👀 翻开底牌，查看释义", use_container_width=True):
-                st.session_state.fc_revealed = True
-                st.rerun()
-        else:
-            fc_w = st.session_state.fc_word
-            st.success(f"🇨🇳 **{fc_w.get('chinese')}**")
-            st.write(f"**英文**: {fc_w.get('english')}")
-            st.info(f"**例句**: {fc_w.get('example_fr')}\n\n_{fc_w.get('example_cn')}_")
-            
-            fc_audio = get_audio_sync(fc_w.get("word_with_article"), "fc")
-            st.audio(fc_audio, format="audio/mp3")
-
-# ================= TAB 5: 句子翻译 =================
-with tab5:
-    st.header("🌐 智能中法互译")
-    st.caption("输入法语长句自动翻译为中文；输入中文自动翻译为地道法语。")
-    
-    with st.form("translate_form"):
-        trans_input = st.text_area("请输入要翻译的文本：", height=150)
-        trans_btn = st.form_submit_button("开始翻译 🚀")
-        
-    if trans_btn and trans_input:
-        with st.spinner("正在呼叫翻译官并录制发音..."):
-            result = get_text_translation(trans_input)
-            st.success("翻译结果：")
-            st.write(f"**{result}**")
-            trans_audio = get_audio_sync(result, "trans")
-            st.audio(trans_audio, format="audio/mp3")
