@@ -6,6 +6,8 @@ import edge_tts
 import os
 import random
 import hashlib
+import csv
+import io
 from datetime import datetime
 
 # --- 核心配置区 ---
@@ -24,7 +26,25 @@ def save_db(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- 1. 核心翻译引擎 (升级：强制同义词/反义词的中法双语结构) ---
+# --- 0.5 导出引擎 (新增：将 JSON 转换为 Anki 兼容的 CSV 格式) ---
+def generate_anki_csv(favorites):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    # 写入表头
+    writer.writerow(['法语单词', '中文释义', '词性', '例句', '例句翻译', '词形溯源'])
+    for item in favorites:
+        writer.writerow([
+            item.get('word_with_article', ''),
+            item.get('chinese', ''),
+            item.get('part_of_speech', ''),
+            item.get('example_fr', ''),
+            item.get('example_cn', ''),
+            item.get('word_origin', '')
+        ])
+    # 必须使用 utf-8-sig 编码，否则导出后用 Excel 打开法语字符和中文会乱码
+    return output.getvalue().encode('utf-8-sig')
+
+# --- 1. 核心翻译引擎 ---
 @st.cache_data(show_spinner=False, ttl=86400) 
 def get_translation(word):
     prompt = f"""
@@ -195,7 +215,6 @@ with tab1:
         if cw.get("conjugation"):
             st.warning(f"⚙️ 变位: {cw.get('conjugation')}")
         
-        # ✨ 升级：同义词与反义词结构化解析 ✨
         if cw.get("synonyms") or cw.get("antonyms"):
             st.markdown("### 🧬 词汇拓展 (点击直接跳转)")
             col_syn, col_ant = st.columns(2)
@@ -256,11 +275,22 @@ with tab1:
                 else:
                     st.error("生成对话失败，请重试。")
 
-# ================= TAB 2: 我的背诵列表 =================
+# ================= TAB 2: 我的背诵列表 (升级：新增 Anki 导出) =================
 with tab2:
     st.header("⭐ 待攻克核心词汇")
     if not st.session_state.db['favorites']:
         st.info("你的背诵列表还是空的，快去查词台添加吧！")
+    else:
+        # ✨ 新增：生成 CSV 并提供下载按钮 ✨
+        csv_data = generate_anki_csv(st.session_state.db['favorites'])
+        st.download_button(
+            label="💾 一键导出为 Anki 格式 (CSV)",
+            data=csv_data,
+            file_name=f"tcf_vocab_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            help="下载后可直接导入 Anki，第一列为正面，后面几列为背面。"
+        )
+        st.divider()
     
     for item in st.session_state.db['favorites']:
         with st.expander(f"{item.get('word_with_article')} - {item.get('chinese')}"):
@@ -314,7 +344,7 @@ with tab4:
             fc_audio = get_audio_sync(fc_w.get("word_with_article"), "fc")
             st.audio(fc_audio, format="audio/mp3")
 
-# ================= TAB 5: 句子翻译 (升级：加入语音) =================
+# ================= TAB 5: 句子翻译 =================
 with tab5:
     st.header("🌐 智能中法互译")
     st.caption("输入法语长句自动翻译为中文；输入中文自动翻译为地道法语。")
@@ -328,7 +358,5 @@ with tab5:
             result = get_text_translation(trans_input)
             st.success("翻译结果：")
             st.write(f"**{result}**")
-            
-            # ✨ 升级：为翻译结果挂载音频节点 ✨
             trans_audio = get_audio_sync(result, "trans")
             st.audio(trans_audio, format="audio/mp3")
