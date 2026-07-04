@@ -11,7 +11,7 @@ from datetime import datetime
 
 # --- 核心配置区 ---
 API_URL = "https://api.deepseek.com/chat/completions" 
-API_KEY = "你的_API_KEY_填在这里" 
+API_KEY = st.secrets["DEEPSEEK_API_KEY"] 
 DB_FILE = "my_vocab_db.json"
 
 # --- 0. 数据库引擎 ---
