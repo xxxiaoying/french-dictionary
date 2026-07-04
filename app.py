@@ -10,7 +10,6 @@ from datetime import datetime
 
 # --- 核心配置区 ---
 API_URL = "https://api.deepseek.com/chat/completions" 
-# 把原来的 "sk-xxxx" 删掉，改成下面这行代码：
 API_KEY = st.secrets["DEEPSEEK_API_KEY"] 
 DB_FILE = "my_vocab_db.json"
 
@@ -25,7 +24,7 @@ def save_db(data):
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# --- 1. 核心翻译引擎 ---
+# --- 1. 核心翻译引擎 (查词) ---
 @st.cache_data(show_spinner=False, ttl=86400) 
 def get_translation(word):
     prompt = f"""
@@ -88,20 +87,62 @@ def get_dialogue(word):
     except Exception as e:
         return {"error": str(e)}
 
-# --- 2. 同步发音引擎 (完美修复音频不刷新 Bug) ---
+# --- 1.8 句子互译引擎 (全新翻译模块) ---
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_text_translation(text):
+    prompt = f"""
+    你是一个专业的法语翻译官。请将以下文本进行中法互译。
+    如果输入是法语，请翻译成中文；如果输入是中文，请翻译成地道的法语。
+    待翻译文本："{text}"
+    只返回纯净的翻译结果，不要有任何多余的废话或解释。
+    """
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
+    
+    try:
+        response = requests.post(API_URL, headers=headers, json=data)
+        return response.json()['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        return f"翻译出错了: {str(e)}"
+
+# --- 2. 同步发音引擎 ---
 @st.cache_data(show_spinner=False)
 def get_audio_sync(text, prefix="audio"):
-    # 给每段文本生成一个独一无二的 MD5 签名，彻底解决浏览器缓存贴图不刷新的问题
     text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
     filename = f"{prefix}_{text_hash}.mp3"
     return asyncio.run(generate_audio(text, filename))
 
 async def generate_audio(text, filename):
-    # 增加本地查重机制：如果这个专属文件已经存在，直接复用，不仅解决 bug 还极大地提升速度
     if not os.path.exists(filename):
         communicate = edge_tts.Communicate(text, "fr-FR-DeniseNeural")
         await communicate.save(filename)
     return filename
+
+# --- 全局公共引擎 ---
+def execute_search(target_word):
+    st.session_state.dialogue_for = None 
+    found_local = None
+    for item in st.session_state.db['history']:
+        if item['original_word'].lower() == target_word.lower():
+            found_local = item
+            break
+            
+    if found_local:
+        st.session_state.current_word = found_local
+        st.toast(f"⚡ 已极速跳转至【{target_word}】", icon="⚡")
+    else:
+        with st.spinner(f"正在全网解析衍生词汇【{target_word}】..."):
+            data = get_translation(target_word)
+            if "error" in data:
+                st.error(data['error'])
+                return
+            else:
+                data['query_time'] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                data['original_word'] = target_word
+                st.session_state.current_word = data
+                st.session_state.db['history'].insert(0, data)
+                save_db(st.session_state.db)
+    st.rerun() 
 
 # --- 3. 界面绘制 ---
 st.set_page_config(page_title="TCF 专属法语词典", page_icon="🇫🇷", layout="centered")
@@ -113,37 +154,17 @@ if 'current_word' not in st.session_state:
 
 st.title("🇫🇷 TCF 核心词库系统")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔍 查词工作台", "⭐ 我的背诵列表", "🕒 历史记录", "🎯 刷词大挑战"])
+# ✨ 新增第五个 Tab：句子翻译
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 查词", "⭐ 背诵", "🕒 历史", "🎯 盲盒", "🌐 翻译"])
 
 # ================= TAB 1: 查词工作台 =================
 with tab1:
-    # 极简智能合并搜索框
     with st.form("search_form", clear_on_submit=True):
         word_input = st.text_input("🔍 请输入法语单词 (自动匹配历史词库或全网解析)：").strip()
         submit_btn = st.form_submit_button("🚀 极速解析")
         
     if submit_btn and word_input:
-        found_local = None
-        for item in st.session_state.db['history']:
-            if item['original_word'].lower() == word_input.lower():
-                found_local = item
-                break
-                
-        if found_local:
-            st.session_state.current_word = found_local
-            st.toast(f"⚡ 已从本地词库极速加载！", icon="⚡")
-        else:
-            with st.spinner("引擎全速解析并生成语音中..."):
-                data = get_translation(word_input)
-                if "error" in data:
-                    st.error(data['error'])
-                else:
-                    data['query_time'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    data['original_word'] = word_input
-                    st.session_state.current_word = data
-                    st.session_state.db['history'].insert(0, data)
-                    save_db(st.session_state.db)
-        st.rerun() 
+        execute_search(word_input)
 
     if st.session_state.current_word:
         cw = st.session_state.current_word
@@ -169,7 +190,6 @@ with tab1:
         st.caption(f"词性：{cw.get('part_of_speech', '')}")
         st.success(f"🇨🇳 {cw.get('chinese', '')}  |  🇬🇧 {cw.get('english', '')}")
         
-        # 这里的音频生成已经切换为防缓存修复版
         word_audio = get_audio_sync(cw.get("word_with_article", cw['original_word']), "word")
         st.audio(word_audio, format="audio/mp3")
         
@@ -182,11 +202,13 @@ with tab1:
             with col_syn:
                 st.write("**同义词:**")
                 for syn in cw.get("synonyms", []):
-                    st.write(f"🟢 {syn}")
+                    if st.button(f"🔍 {syn}", key=f"syn_{syn}_{cw['original_word']}"):
+                        execute_search(syn)
             with col_ant:
                 st.write("**反义词:**")
                 for ant in cw.get("antonyms", []):
-                    st.write(f"🔴 {ant}")
+                    if st.button(f"🔍 {ant}", key=f"ant_{ant}_{cw['original_word']}"):
+                        execute_search(ant)
             
         collocations = cw.get("collocations", [])
         if collocations:
@@ -207,13 +229,16 @@ with tab1:
             st.session_state.dialogue_for = cw['original_word']
             
         if st.session_state.get('dialogue_for') == cw['original_word']:
-            with st.spinner("正在连线大模型排练对话剧本..."):
+            with st.spinner("正在连线大模型排练对话剧本，并录制语音中..."):
                 d_data = get_dialogue(cw['original_word'])
                 if "error" not in d_data:
                     st.info(f"🎭 **场景：{d_data.get('scenario', '')}**")
                     for line in d_data.get('dialogue', []):
                         st.write(f"**{line.get('speaker')}**: {line.get('fr')}")
                         st.caption(f"_{line.get('cn')}_")
+                        # ✨ 改造：给对话的每一句加上独立的发音按钮 ✨
+                        dia_audio = get_audio_sync(line.get('fr'), "dialogue")
+                        st.audio(dia_audio, format="audio/mp3")
                 else:
                     st.error("生成对话失败，请重试。")
 
@@ -240,8 +265,7 @@ with tab3:
             st.caption(f"时间: {item.get('query_time')}")
         with col2:
             if st.button("🔄 查看", key=f"hist_btn_{i}_{item.get('original_word')}"):
-                st.session_state.current_word = item
-                st.toast(f"✅ 已加载【{item.get('word_with_article')}】，请返回【查词工作台】！", icon="🚀")
+                execute_search(item['original_word'])
         st.divider()
 
 # ================= TAB 4: 刷词大挑战 =================
@@ -275,3 +299,18 @@ with tab4:
             
             fc_audio = get_audio_sync(fc_w.get("word_with_article"), "fc")
             st.audio(fc_audio, format="audio/mp3")
+
+# ================= TAB 5: 句子翻译 (全新模块) =================
+with tab5:
+    st.header("🌐 智能中法互译")
+    st.caption("输入法语长句自动翻译为中文；输入中文自动翻译为地道法语。")
+    
+    with st.form("translate_form"):
+        trans_input = st.text_area("请输入要翻译的文本：", height=150)
+        trans_btn = st.form_submit_button("开始翻译 🚀")
+        
+    if trans_btn and trans_input:
+        with st.spinner("正在呼叫翻译官..."):
+            result = get_text_translation(trans_input)
+            st.success("翻译结果：")
+            st.write(f"**{result}**")
